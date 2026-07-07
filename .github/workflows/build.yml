@@ -1,0 +1,96 @@
+name: Build Lyra binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag and release"
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: lyra-linux-x86_64
+            binary_name: lyra
+          - os: macos-latest
+            artifact_name: lyra-macos-x86_64
+            binary_name: lyra
+          - os: windows-latest
+            artifact_name: lyra
+            binary_name: lyra.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build one-file executable
+        run: pyinstaller lyra.spec --noconfirm --clean
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p dist_out
+          cp "dist/${{ matrix.binary_name }}" "dist_out/${{ matrix.artifact_name }}$( [[ '${{ matrix.binary_name }}' == *.exe ]] && echo .exe )"
+
+      - name: Smoke test (version check)
+        shell: bash
+        run: |
+          chmod +x "dist/${{ matrix.binary_name }}" || true
+          "dist/${{ matrix.binary_name }}" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist_out/*
+
+  release:
+    name: Tag & attach binaries to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize tag name
+        id: tag
+        run: |
+          version="${{ inputs.version }}"
+          if [[ "$version" != v* ]]; then
+            version="v$version"
+          fi
+          echo "tag_name=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: ${{ steps.tag.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          files: release/*
+          generate_release_notes: true
