@@ -9,8 +9,8 @@ non-interactive usage for automation.
 ## ☄️ How to Install (Easy Way)
 1. [Download the latest release.](https://github.com/ErfanNamira/Lyra/releases/latest)
 2. Rename the downloaded file to `lyra.exe` (optional, just tidier).
-3. In PowerShell, run: `.\lyra-windows-x86_64.exe --setup` (or `.\lyra.exe --setup` if renamed)
-4. Run `.\lyra-windows-x86_64.exe` (or `.\lyra.exe`)
+3. In PowerShell, run: `.\lyra.exe --setup`
+4. Run `lyra.exe`
 
 ## 🌟 Features
 
