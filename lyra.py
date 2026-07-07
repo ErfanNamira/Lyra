@@ -7,8 +7,13 @@ Lyra can be used interactively (just run it with no arguments) or
 non-interactively for scripting:
 
     lyra.py "https://open.spotify.com/track/..." --format flac
+    lyra.py "https://open.spotify.com/playlist/..." --download-path D:/Music
     lyra.py --batch urls.txt
     lyra.py --setup
+
+Downloads are auto-organized under the chosen download path (default: the
+current working directory): single tracks go in a "Singles" subfolder,
+playlists and albums each get their own subfolder named after them.
 
 Run `lyra.py --help` for the full list of CLI options.
 """
@@ -18,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,7 +56,14 @@ DEFAULTS = {
     "lyrics": "synced",
     "generate_lrc": True,
     "output": "{artists} - {title} - {year}.{output-ext}",
+    # Empty string means "use the current working directory at run time",
+    # rather than freezing whatever directory happened to be current when
+    # the setting was saved.
+    "download_path": "",
 }
+
+SINGLES_SUBFOLDER = "Singles"
+LIST_SUBFOLDER = "{list-name}"
 
 FORMAT_CHOICES = ["mp3", "flac", "ogg", "opus", "m4a", "wav"]
 LYRICS_CHOICES = ["synced", "genius", "musixmatch", "azlyrics", "none"]
@@ -155,6 +168,15 @@ def show_settings(config: dict):
     table.add_row("Lyrics", config["lyrics"])
     table.add_row("Generate .lrc", "Yes" if config["generate_lrc"] else "No")
     table.add_row("Output pattern", config["output"])
+    download_path = config.get("download_path", "")
+    table.add_row(
+        "Download path",
+        f"{download_path}" if download_path else f"{Path.cwd()} [dim](current directory)[/]",
+    )
+    table.add_row(
+        "Folder layout",
+        f"tracks → {SINGLES_SUBFOLDER}/, playlists & albums → {LIST_SUBFOLDER}/",
+    )
 
     console.print(table)
     console.print()
@@ -285,12 +307,61 @@ def edit_settings(config: dict) -> dict:
     else:
         config["generate_lrc"] = False
 
-    output = Prompt.ask("Output naming pattern", default=config["output"])
+    output = Prompt.ask("Output naming pattern (filename only, no folder)", default=config["output"])
     config["output"] = output
+
+    console.print(
+        "\n[dim]Downloads are auto-organized into subfolders: tracks go in "
+        f"'{SINGLES_SUBFOLDER}/', playlists and albums go in a folder named after "
+        "them.[/]"
+    )
+    current_dl_path = config.get("download_path", "") or "(current directory)"
+    download_path = Prompt.ask(
+        "Default download path (leave as-is or type '.' for current working directory)",
+        default=current_dl_path,
+    )
+    if download_path.strip() in ("", ".", "(current directory)"):
+        config["download_path"] = ""
+    else:
+        config["download_path"] = download_path.strip()
 
     save_config(config)
     console.print("\n[green]✔ Settings saved.[/]\n")
     return config
+
+
+# --------------------------------------------------------------------------- #
+# Download path / output template logic
+# --------------------------------------------------------------------------- #
+
+def detect_spotify_type(url: str) -> str:
+    """Returns 'track', 'playlist', 'album', or 'unknown' based on the URL/URI."""
+    match = re.search(r"(track|playlist|album)", url, re.IGNORECASE)
+    return match.group(1).lower() if match else "unknown"
+
+
+def subfolder_for(url: str) -> str:
+    """Subfolder (relative to the download path) content of this type lands in."""
+    url_type = detect_spotify_type(url)
+    if url_type == "track":
+        return SINGLES_SUBFOLDER
+    if url_type in ("playlist", "album"):
+        return LIST_SUBFOLDER
+    return ""
+
+
+def resolve_download_path(download_path: str) -> Path:
+    """Empty/blank download_path means 'current working directory, right now'."""
+    if download_path and download_path.strip():
+        return Path(download_path).expanduser()
+    return Path.cwd()
+
+
+def build_output_template(download_path: str, url: str, filename_pattern: str) -> str:
+    base = resolve_download_path(download_path)
+    sub = subfolder_for(url)
+    full_path = (base / sub / filename_pattern) if sub else (base / filename_pattern)
+    return str(full_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -312,7 +383,10 @@ def build_command(url: str, config: dict) -> list:
         if config["generate_lrc"]:
             cmd += ["--generate-lrc"]
 
-    cmd += ["--output", config["output"]]
+    output_template = build_output_template(
+        config.get("download_path", ""), url, config["output"]
+    )
+    cmd += ["--output", output_template]
 
     return cmd
 
@@ -360,9 +434,22 @@ def run_download(config: dict):
     if not url.strip():
         console.print("[red]No URL entered, returning to menu.[/]\n")
         return
+    url = url.strip()
+
+    default_dl_path = config.get("download_path", "") or str(Path.cwd())
+    download_path = Prompt.ask(
+        "[bold cyan]Download path[/]", default=default_dl_path
+    ).strip() or default_dl_path
+
+    sub = subfolder_for(url)
+    if sub:
+        console.print(f"[dim]Will be saved under: {Path(download_path) / sub}[/]")
+    console.print()
+
+    session_config = config.copy()
+    session_config["download_path"] = download_path
 
     override = Confirm.ask("Use current default settings for this download?", default=True)
-    session_config = config.copy()
 
     if not override:
         session_config["threads"] = IntPrompt.ask("Threads", default=config["threads"])
@@ -381,7 +468,7 @@ def run_download(config: dict):
             session_config["generate_lrc"] = False
         session_config["output"] = Prompt.ask("Output naming pattern", default=config["output"])
 
-    execute_download(url.strip(), session_config)
+    execute_download(url, session_config)
 
 
 def run_batch_download(config: dict, file_path: Optional[str] = None):
@@ -401,12 +488,21 @@ def run_batch_download(config: dict, file_path: Optional[str] = None):
         console.print("[yellow]No URLs found in file.[/]\n")
         return
 
+    default_dl_path = config.get("download_path", "") or str(Path.cwd())
+    download_path = Prompt.ask(
+        "[bold cyan]Download path for this batch[/] "
+        "(each URL still lands in its own Singles/playlist/album subfolder)",
+        default=default_dl_path,
+    ).strip() or default_dl_path
+    session_config = config.copy()
+    session_config["download_path"] = download_path
+
     console.print(f"[bold]Found {len(urls)} URL(s). Starting batch download...[/]\n")
 
     results = {"success": 0, "error": 0, "cancelled": 0}
     for i, url in enumerate(urls, start=1):
         console.print(f"[bold blue]--- [{i}/{len(urls)}] {url} ---[/]")
-        status = execute_download(url, config)
+        status = execute_download(url, session_config)
         results[status] = results.get(status, 0) + 1
         if status == "cancelled":
             if not Confirm.ask("Continue with remaining URLs?", default=False):
@@ -440,7 +536,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", choices=FORMAT_CHOICES, help="Audio format override")
     parser.add_argument("--lyrics", choices=LYRICS_CHOICES, help="Lyrics provider override")
     parser.add_argument("--threads", type=int, help="Thread count override")
-    parser.add_argument("--output", help="Output naming pattern override")
+    parser.add_argument("--output", help="Output naming pattern override (filename only, no folder)")
+    parser.add_argument(
+        "--download-path", metavar="PATH",
+        help="Base download path (default: current working directory). "
+             "Tracks go in a Singles/ subfolder, playlists/albums in a subfolder named after them.",
+    )
     parser.add_argument(
         "--generate-lrc", dest="generate_lrc", action="store_true", default=None,
         help="Force-enable synced .lrc generation",
@@ -474,6 +575,8 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         session_config["threads"] = args.threads
     if args.output:
         session_config["output"] = args.output
+    if args.download_path:
+        session_config["download_path"] = args.download_path
     if args.generate_lrc is not None:
         session_config["generate_lrc"] = args.generate_lrc
     return session_config
